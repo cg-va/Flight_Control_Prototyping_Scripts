@@ -447,11 +447,12 @@ class Window(QDialog):
         self.btn_update_model.setEnabled(True)
 
     def onTrimChanged(self):
-        try:
-            self.trim_airspeed = float(self.line_edit_trim.text())
-        except ValueError:
+        # Read the spinbox's internal float directly. Avoid float(.text()), which
+        # parses the locale-formatted displayed string (e.g. "20,00" on de_AT/de_DE
+        # locales) and raises ValueError on non-en_US decimal separators.
+        self.trim_airspeed = float(self.line_edit_trim.value())
+        if self.trim_airspeed < 0:
             self.trim_airspeed = 0
-            self.line_edit_trim.setValue(self.trim_airspeed)
 
         self.btn_run_sys_id.setEnabled(True)
         self.plotInputOutput()
@@ -1204,7 +1205,7 @@ class Window(QDialog):
             self.input_scale_combo.setEnabled(False)
             self.line_edit_trim.setEnabled(False)
 
-        if self.model_ref is None or redraw:
+        if self.model_ref is None or redraw or not hasattr(self, 't_est'):
             # First time we have no plot reference, so do a normal plot.
             # .plot returns a list of line <reference>s, as we're
             # only getting one we can take the first element.
