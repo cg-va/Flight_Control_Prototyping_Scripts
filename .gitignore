@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Poetry
+.poetry/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local work-in-progress (don't pollute the team repo)
+HANDOFF_*.md
+TODO_local.md
+*.tmp
+*.tmp.*
+
+# Filtered ulog outputs produced by preprocess_ulog.py — these are
+# regeneratable and tend to live wherever the user puts them.
+# (autotune/logs/*.ulg are upstream Auterion test fixtures — keep those.)
+*_filtered.ulg
