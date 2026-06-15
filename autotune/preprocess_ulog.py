@@ -151,12 +151,42 @@ def filter_topic_inplace(topic, t_start, t_end, notch_hz, lp_hz, decimate_factor
             new_data[k] = new_data[k][trim_samples:-trim_samples]
         target_len -= 2 * trim_samples
 
-    # Rebuild timestamps as uniformly-spaced uint64 microseconds
-    dt_new_us = int(round(1e6 / fs_new))
-    t_first = int(t_win[trim_samples] * 1e6) if trim_samples > 0 else int(t_win[0] * 1e6)
-    new_data['timestamp'] = np.arange(target_len, dtype=np.uint64) * dt_new_us + t_first
+    # Preserve original timestamps (don't rebuild as uniform — that breaks per-axis window
+    # extraction on logs with irregular sampling, e.g. PX4 autotune logs where the chirp
+    # window can drop from 400 Hz to ~287 Hz under CPU load. Rebuilding as uniform at the
+    # median rate compresses time-space and causes cross-axis sample contamination.
+    # Reuse the timestamps from the original window, trimmed + decimated identically.
+    orig_ts = np.asarray(topic.data['timestamp'])[mask]
+    if decimate_factor and decimate_factor > 1:
+        orig_ts = orig_ts[::decimate_factor]
+    # length-match orig_ts to target post-trim length
+    if trim_samples > 0 and len(orig_ts) >= 2 * trim_samples:
+        orig_ts = orig_ts[trim_samples:len(orig_ts) - trim_samples]
+    # Pad/truncate to match target_len (rounding/decimate-tail can introduce off-by-one)
+    if len(orig_ts) > target_len:
+        orig_ts = orig_ts[:target_len]
+    elif len(orig_ts) < target_len:
+        # extend by extrapolating last delta
+        if len(orig_ts) >= 2:
+            dt_us = orig_ts[-1] - orig_ts[-2]
+            pad = orig_ts[-1] + np.arange(1, target_len - len(orig_ts) + 1, dtype=orig_ts.dtype) * dt_us
+            orig_ts = np.concatenate([orig_ts, pad])
+        else:
+            orig_ts = np.concatenate([orig_ts, np.full(target_len - len(orig_ts), orig_ts[-1] if len(orig_ts) else 0, dtype=orig_ts.dtype)])
+    new_data['timestamp'] = orig_ts.astype(np.uint64)
     if 'timestamp_sample' in new_data:
-        new_data['timestamp_sample'] = new_data['timestamp'].copy()
+        # use original timestamp_sample if present, same processing
+        orig_tss = np.asarray(topic.data['timestamp_sample'])[mask]
+        if decimate_factor and decimate_factor > 1:
+            orig_tss = orig_tss[::decimate_factor]
+        if trim_samples > 0 and len(orig_tss) >= 2 * trim_samples:
+            orig_tss = orig_tss[trim_samples:len(orig_tss) - trim_samples]
+        if len(orig_tss) > target_len:
+            orig_tss = orig_tss[:target_len]
+        elif len(orig_tss) < target_len:
+            pad_len = target_len - len(orig_tss)
+            orig_tss = np.concatenate([orig_tss, np.full(pad_len, orig_tss[-1] if len(orig_tss) else 0, dtype=orig_tss.dtype)])
+        new_data['timestamp_sample'] = orig_tss.astype(np.uint64)
 
     # Compute axis metrics on the filtered data (only valid for vehicle_torque_setpoint + vehicle_angular_velocity)
     if topic.name == 'vehicle_torque_setpoint':
@@ -185,11 +215,25 @@ def main():
                     help='Decimation factor (default 4)')
     ap.add_argument('--no-decimate', action='store_true')
     ap.add_argument('--no-notch', action='store_true')
+    ap.add_argument('--chirp', action='store_true',
+                    help='Chirp-mode preset for PX4 autotune logs (short ~5s per-axis windows): '
+                         'just filtfilt LP at --lp-hz, no notch, no decimate, edge-trim 0.2s. '
+                         'Empirically wins on short chirp windows where decimation kills RLS convergence.')
     ap.add_argument('--t-start', type=float, default=None,
                     help='Window start in s after arming (default: 0)')
     ap.add_argument('--t-end', type=float, default=None,
                     help='Window end in s after arming (default: disarm)')
     args = ap.parse_args()
+
+    if args.chirp:
+        # Chirp-mode preset: short per-axis windows from PX4 autotune.
+        # Aggressive decimation + notch hurts more than helps when window is 5-10s.
+        # Empirical result on real-flight log_42: chirp mode jumps fit from ~60% raw
+        # to ~70% per axis; full preprocessor drops it to 20-55%.
+        args.no_notch = True
+        args.no_decimate = True
+        if args.lp_hz is None:
+            args.lp_hz = 20.0  # MC default; user can override
 
     if not args.input.exists():
         sys.exit(f'Input not found: {args.input}')
@@ -245,12 +289,16 @@ def main():
         coh, band_frac = metrics(u_raw, av_raw, fs_orig_ts)
         metrics_before[f'axis{ax}'] = {'coherence_0p5_10hz': round(coh, 3), 'band_excitation_frac': round(band_frac, 4)}
 
+    # Chirp mode uses a shorter edge trim because per-axis chirp windows are typically 5-10s;
+    # a 1s trim on each side burns 20-40% of the window. 0.2s is enough for filtfilt boundary safety.
+    edge_trim_s = 0.2 if args.chirp else EDGE_TRIM_S
+
     print('Filtering vehicle_torque_setpoint...')
-    fs_orig_ts, fs_new_ts, _ = filter_topic_inplace(ts_topic, t_start, t_end, notch_hz, lp_hz, decimate_factor, EDGE_TRIM_S)
+    fs_orig_ts, fs_new_ts, _ = filter_topic_inplace(ts_topic, t_start, t_end, notch_hz, lp_hz, decimate_factor, edge_trim_s)
     print(f'  {fs_orig_ts:.0f} Hz -> {fs_new_ts:.0f} Hz, {len(ts_topic.data["timestamp"])} samples')
 
     print('Filtering vehicle_angular_velocity...')
-    fs_orig_av, fs_new_av, _ = filter_topic_inplace(av_topic, t_start, t_end, notch_hz, lp_hz, decimate_factor, EDGE_TRIM_S)
+    fs_orig_av, fs_new_av, _ = filter_topic_inplace(av_topic, t_start, t_end, notch_hz, lp_hz, decimate_factor, edge_trim_s)
     print(f'  {fs_orig_av:.0f} Hz -> {fs_new_av:.0f} Hz, {len(av_topic.data["timestamp"])} samples')
 
     # Metrics AFTER (compute from the new filtered topic data directly)
